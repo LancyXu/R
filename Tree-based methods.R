@@ -13,7 +13,7 @@ needed <- c("rpart",'tree',"randomForest","ada","e1071","gbm","xgboost","rattle"
 installIfAbsentAndLoad(needed)
 
 #Load data
-mydata<-read.csv("Assignment2TrainingData.csv",sep=",",header=T)
+mydata<-read.csv("Churndata.csv",sep=",",header=T)
 mydata<-mydata[,-1]
 mydata$SeniorCitizen<-as.factor(mydata$SeniorCitizen)
 #Define cost function

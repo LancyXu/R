@@ -1,0 +1,907 @@
+---
+title: "ML Final"
+author: "Will Bowman, Lanxin Xu, Rob Downs, Karen Ficenec"
+date: "December 8, 2017"
+output:
+  html_document: default
+  pdf_document: default
+pdf_document: default
+---
+  
+```{r set, include=FALSE}
+installIfAbsentAndLoad <- function(neededVector) {
+  for(thispackage in neededVector) {
+    if( ! require(thispackage, character.only = T) )
+    { install.packages(thispackage)}
+    require(thispackage, character.only = T)
+  }
+}
+```
+
+
+```{r, include=FALSE}
+needed  <-  c("ISLR","MASS", "boot", "FNN", "rotationForest", "plyr", "class", "pls", "leaps", "xgboost", "randomForest", "bestglm", "e1071", "GGally", "broom", "glmnet", "caret", "ggplot2", "klaR")
+installIfAbsentAndLoad(needed)
+
+
+```
+
+
+# Predicting Voices
+\newline Data from: https://www.kaggle.com/primaryobjects/voicegender
+
+We are using numeric data to predict if the a voice is male or female. Many of the predictors were highly correlated and had to be immediately removed. A list of variables is below: \newline
+
+*meanfreq*: mean frequency (in kHz) \newline
+
+*sd*: standard deviation of frequency\newline
+
+*median*: median frequency (in kHz)\newline
+
+*Q25*: first quantile (in kHz)\newline
+
+*Q75*: third quantile (in kHz)\newline
+
+*IQR*: interquantile range (in kHz)\newline
+
+*skew*: skewness (see note in specprop description)\newline
+
+*kurt*: kurtosis (see note in specprop description)\newline
+
+*sp.ent*: spectral entropy\newline
+
+*sfm*: spectral flatness\newline
+
+*mode*: mode frequency\newline
+
+*centroid*: frequency centroid (see specprop)\newline
+
+*peakf*: peak frequency (frequency with highest energy)\newline
+
+*meanfun*: average of fundamental frequency measured across acoustic signal\newline
+
+*minfun*: minimum fundamental frequency measured across acoustic signal\newline
+
+*maxfun*: maximum fundamental frequency measured across acoustic signal\newline
+
+*meandom*: average of dominant frequency measured across acoustic signal\newline
+
+*mindom*: minimum of dominant frequency measured across acoustic signal\newline
+
+*maxdom*: maximum of dominant frequency measured across acoustic signal\newline
+
+*dfrange*: range of dominant frequency measured across acoustic signal\newline
+
+*modindx*: modulation index. Calculated as the accumulated absolute difference between adjacent measurements of fundamental frequencies divided by the frequency range\newline
+
+*label*: male or female\newline
+
+## Initialization and Subsetting of data
+```{r Init and Subsetting}
+data <- na.omit(read.csv(file = "voice.csv"))
+
+# Here we are removing variables with linear dependencies. 
+# Theese variables are extreemly correlated (cor~1) with another vairable and 
+# many algorithms - including regsubset - will not run while they are present.
+data$maxdom <- NULL
+data$median <- NULL
+data$Q25 <- NULL
+data$skew <- NULL
+data$centroid <- NULL
+
+
+#cor(data[,-16]) 
+#ggpairs(data[,-16])
+# Weused cor and ggpairs to look at relationships between our predictors
+# They are not printed here for space conservation
+# Please feel free to run them if you would like
+```
+
+There are 1508 females and 1424 males in out data set. This is an optimal distribution which will lead to minimal bias in our models.
+```{r}
+table(data$label)
+```
+
+###Subset selection
+Removing the linear dependencies was not enough. We will also run best subsets selection algorithm within regsubsets to further narrow down our choice of predictors.This resulted in the removal of dfrange and modindx.
+```{r}
+#leaps(x=dataScale, y=label, nbest = 1, method ="bic)
+
+sub <- regsubsets(label ~ ., data = data, nbest = 1, nvmax = NULL,method = "exhaustive")
+plot(sub, main = "Subset Selection")
+```
+
+We wil take the model with the highest adjusted R^2
+```{r}
+which.min(summary(sub)$bic)
+summary(sub)$which[11,]
+
+#modify data accordingly
+data$dfrange <- NULL
+data$modindx <- NULL
+data$mindom <- NULL
+data$meanfreq <- NULL
+#These variables were removed after running glm, wehre they had very high p values.
+data$maxfun <- NULL
+data$sd <- NULL
+data$meandom <- NULL
+
+
+#names <- colnames(data)
+#for (i in 2:(ncol(data))) {
+#  hist(data[,i-1], main = names[i-1])
+#}
+```
+
+### Data Prep
+Here, we prepare the data by scaling and performing inital partitions of train and test sets. These will be used for initial testing of models. Out best model will be tested more rigorously.
+```{r data setup}
+
+#create data for models
+dataScale <- data.frame(scale(data[-9], center = TRUE, scale = TRUE))
+label <- data$label
+vdata <- data.frame(dataScale, label)
+
+set.seed(9757)
+train<-sample(1:nrow(dataScale), nrow(dataScale)/1.5)
+test<-(-train)
+y.test<-label[test]
+test <- dataScale[test,]
+y.train <- label[train]
+train <- dataScale[train,]
+
+
+```
+
+
+
+## GLM
+The first model will will run is logistic regression. This model will serve as a good baseline predictor and will show us the signifigance of our predictors. The glm function may suffer if multicollinearity is present. We will run ridge regression to see if the L2 penalty improves predictive power.
+```{r glm}
+
+glm.fit <- glm(y.train~., data = train, family = binomial)
+summary(glm.fit)
+```
+
+Below is the CV error of our model.
+```{r}
+glmCV <- list()
+for (i in 1:10) {
+  glm.fit <- glm(label~., data = vdata, family = "binomial")
+  glmCV[i] <- cv.glm(vdata, glm.fit, K = 10)$delta[1]
+}
+plot(seq(1,10,1), glmCV, main="Logit Cross Validation 10F", xlab = "Iteration", ylab = "Error", type = "b")
+
+
+
+errTypes <- matrix(ncol = 2, nrow = 1000) 
+cTables <- matrix(ncol = 4, nrow = 1000) 
+colnames(errTypes) <- c("false positives","false negatives")
+b = 0
+for (i in 1:nrow(errTypes)){
+  b = b + 0.001
+  glm.pred <- rep('PredFemale', nrow(test))
+  glm.pred[predict(glm.fit,newdata = test, type='response')>b] <- 'PredMale'
+  errTypes[i,] <- c((table(glm.pred, y.test)[2])/nrow(test), (table(glm.pred, y.test)[3])/nrow(test))
+  cTables[i,] <- table(glm.pred, y.test)[1:4]
+}
+```
+
+```{r, echo = FALSE}
+plot(1, type="n", xlim=c(0.0, 1), ylim=c(0, 0.5), xlab = "Above is Yes Threshold", ylab = "Err Rate",
+     main = "False Pos and Neg as Decision Boundary Increases for logit ")
+legend(.7,0.5, c("False Pos","False Neg", "Total Error"), lty=c(1,1), lwd=c(1.5,1.5),col=c("blue","green", "red"))
+lines(seq(.001, 1, .001), errTypes[,1], col = "blue", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,2], col = "green", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,1]+errTypes[,2], col = "red")
+abline(h = 0)
+
+glm.probs <- predict.glm(glm.fit, newdata = test, type="response")
+glm.pred <- rep('PredFemale', nrow(test))
+glm.pred[predict(glm.fit, newdata = test, type = "response")>0.5] <- 'PredMale'
+mytable <- table(glm.pred, y.test)
+mytable
+correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+type1err <- mytable[2]/sum(mytable[1:4])
+type2err <- mytable[3]/sum(mytable[1:4])
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+LR <- paste("Logistic Reg", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+
+LR
+
+```
+
+## Ridge
+We are running a ridge regression to determine if an L2 penalty can aid our predictive power.
+```{r Ridge}
+
+## determine best lambda
+lambdas <- 10^seq(3, -2, by = -.1)
+rd.fit <- glmnet(as.matrix(vdata[,-9]), vdata$label, alpha = 0, lambda = lambdas, family = "binomial")
+cv_fit <- cv.glmnet(as.matrix(vdata[,-9]), vdata$label, alpha = 0, lambda = lambdas, family = "binomial", nfolds = 10)
+bestlam <- cv_fit$lambda.min
+bestlam
+
+plot(cv_fit)
+optlambda <- cv_fit$lambda.min
+optlambda
+#The penalty is low
+
+## use best lambda to perform ridge regression.
+rd.pred <- predict(rd.fit, s = optlambda, newx = as.matrix(test))
+hist(rd.pred)
+
+rd.pred <- rep('PredFemale', nrow(test))
+rd.pred[predict(rd.fit, s = optlambda, newx = as.matrix(test))>0] <- 'PredMale'
+mytable <- table(rd.pred, y.test)
+mytable
+
+
+```
+
+
+```{r, echo=FALSE}
+correct <- (mytable[1]+mytable[4])/nrow(test)
+err <- (mytable[2] + mytable[3])/nrow(test)
+type1err <- mytable[2]/nrow(test)
+type2err <- mytable[3]/nrow(test)
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+RID <- paste("Ridge", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+
+
+errTypes <- matrix(ncol = 2, nrow = 1000) 
+cTables <- matrix(ncol = 4, nrow = 1000) 
+colnames(errTypes) <- c("false positives","false negatives")
+b = -5
+for (i in 1:nrow(errTypes)){
+  b = b + 0.01 
+  rd.pred <- rep('PredFemale', nrow(test))
+  rd.pred[predict(rd.fit, s = optlambda, newx = as.matrix(test))>b] <- 'PredMale'
+  errTypes[i,] <- c((table(rd.pred, y.test)[2])/nrow(test), (table(rd.pred, y.test)[3])/nrow(test))
+  cTables[i,] <- table(rd.pred, y.test)[1:4]
+}
+
+plot(1, type="n", xlim=c(0, 1), ylim=c(0, 0.6), xlab = "Above is Yes Threshold", ylab = "Err Rate",
+     main = "False Pos and Neg as decision boundary increases")
+legend(0.7,0.6, c("False Pos","False Neg", "Total Error"), lty=c(1,1), lwd=c(1.5,1.5),col=c("blue","green", "red"))
+lines(seq(.001, 1, .001), errTypes[,1], col = "blue", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,2], col = "green", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,1]+errTypes[,2], col = "red")
+abline(h = 0)
+
+RID
+```
+
+## KNN
+
+KNN k = 1 has an incredibly low average error rate. To find the best k value we ran KNN for odd values from 1 to 19 over 50 iterations. We then took the best k and ran 50 more iterations with the test test. Finally we ran KNN k=1 with the entire dataset.
+
+We compared our output of k = 1 with k = 3 for general comparison. k = 3 performs well also.
+```{r KNN}
+dataknn <- data.frame(dataScale)
+dataknn <- sapply(dataknn, as.numeric)
+dataknn <- data.frame(dataknn, label)
+
+n = nrow(dataknn)
+trainprop <- 0.75
+valprop <- 0.15
+testprop <- 0.10
+
+bestvalidate <- matrix(ncol = 3, nrow = 50)
+
+
+## we used this code to first determine the best value of k, which was 1 and then to run 50 iterations of k = 1.
+## Commented code was used for best K
+
+for (t in 1:50) {
+  trainNo <- sample(n, n * trainprop)
+  validateNo <- sample(setdiff(1:n, trainNo) , n * valprop)
+  testNo <- setdiff(setdiff(1:n, trainNo), validateNo)
+  
+  trainset <- dataknn[trainNo,]
+  validateset <- dataknn[validateNo,]
+  testset <- dataknn[testNo,]
+  
+  ## setting up data for knn use
+  
+  train.x <- trainset[,(-(ncol(dataScale)+1))]
+  validate.x <- validateset[,(-(ncol(dataScale)+1))]
+  test.x <- testset[,(-(ncol(dataScale)+1))]
+  train.y <- trainset$label
+  validate.y <- validateset$label
+  test.y <- testset$label
+  
+  ## building model 
+  validate.errors <- (0)
+  train.errors <- (0)
+  validate.array <- (0)
+  
+#  for (i in 1:19) {
+#    if (i %% 2 == 1) {
+#      knn.pred <- knn(train.x, validate.x, train.y, k=1)
+#      validate.errors[k] <- mean(validate.y != knn.pred)
+#      
+#      knn.pred <- knn(train.x, train.x,  train.y, k=1)
+#      train.errors[k] <- mean(train.y != knn.pred)
+#      
+#    }
+#  }
+  
+  
+  ##Test data
+  test.errors <- (0)
+  knn.predtest <- knn(train.x, validate.x, train.y, k = 1) #which.min(validate.errors))
+  validate.errors <- mean(validate.y != knn.predtest)
+  
+  k <- which.min(validate.errors)
+  valMSE <- validate.errors[which.min(validate.errors)]
+  testMSE <- test.errors
+  bestvalidate[t, ] <- c(k, valMSE, testMSE)
+  
+  bestvalidate <- data.frame(bestvalidate)
+  names(bestvalidate)[1] <- paste("k")
+  names(bestvalidate)[2] <- paste("validateMSE")
+  names(bestvalidate)[3] <- paste("testMSE")
+}
+
+#print(paste("Validate mean: ", mean(bestvalidate$validateMSE)))
+#print(paste("Validate SD: ", sd(bestvalidate$validateMSE)))
+print(paste("Test error mean: :", mean(bestvalidate$testMSE)))
+print(paste("Test error SD: ", sd(bestvalidate$testMSE)))
+
+plot(1, type='n', xlim=c(1, 50), ylim=c(0,0.05), xlab='Replication', ylab='Error', main='Validate Errors (with mean) for Many Partitionings of the Data')
+lines(seq(1, 50), bestvalidate$validateMSE[50:1], type='b', col=1, pch=16)
+#lines(seq(1,50), bestvalidate$testMSE[1:50], type='b', col=2, pch=16)
+abline(a = mean(bestvalidate$validateMSE), b = 0, col=2)
+#abline(a = mean(bestvalidate$testMSE), b = 0, col=1)
+#legend("topleft", legend = c("Validation MSE (with mean)", "Test MSE (with mean)"), col=c(2, 1), cex=.75, pch=16)
+legend("topleft", legend = "Mean", col=c(1), cex=.75, lty = 1)
+
+
+## 1 is the best k value
+
+knn.predtest <- knn(train, test, y.train, k = 1)
+test.error <- mean(y.test != knn.predtest)
+test.error
+mytable <- table(y.test, knn.predtest)
+mytable
+
+
+#validate
+```
+```{r, echo=FALSE}
+correct <- (mytable[1]+mytable[4])/nrow(test)
+err <- (mytable[2] + mytable[3])/nrow(test)
+type1err <- mytable[2]/nrow(test)
+type2err <- mytable[3]/nrow(test)
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+KNN1 <- paste("KNN = 1", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+KNN1
+```
+KNN = 3
+```{r}
+knn.predtest <- knn(train, test, y.train, k = 3)
+test.error <- mean(y.test != knn.predtest)
+mytable <- table(y.test, knn.predtest)
+```
+
+```{r, echo=FALSE}
+correct <- (mytable[1]+mytable[4])/nrow(test)
+err <- (mytable[2] + mytable[3])/nrow(test)
+type1err <- mytable[2]/nrow(test)
+type2err <- mytable[3]/nrow(test)
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+KNN3 <- paste("KNN = 3", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+KNN3
+```
+
+```{r kill KNN, echo=FALSE}
+test.x <- NULL
+train.x <- NULL
+validate.x <- NULL
+testset <- NULL
+trainset <- NULL
+validateset <- NULL
+trainNo <- NULL
+testNo <- NULL
+validateNo <- NULL
+```
+
+
+##LDA
+
+We ran LDA over 5 partitions of data to get a general grasp of how it performs. It is a very strong model, just slightly lagging behind KNN. 
+
+```{r}
+for (i in 1:5) {
+  n = nrow(dataScale)
+  trainprop <- 0.60
+  testprop <- 0.40
+  trainNo <- sample(n, n * trainprop)
+  testNo <- sample(setdiff(1:n, trainNo) , n * testprop)
+  
+  trainset <- data.frame(dataScale, label)[trainNo,]
+  testset <- data.frame(dataScale, label)[testNo,]
+  
+  lda.fit = lda(trainset$label~., data=trainset)
+  lda.pred <- predict(lda.fit, newdata = testset, type="response")
+  mytable <- table(testset$label, lda.pred$class)   
+  
+  correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+  err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+  type1err <- mytable[2]/sum(mytable[1:4])
+  type2err <- mytable[3]/sum(mytable[1:4])
+  power <- 1- type2err
+  precision <- mytable[4]/(mytable[2]+mytable[4])
+  LDA <- paste("LDA", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+  print(paste("Partition", i, ":", LDA))
+}
+
+```
+
+Now let's cross validate
+```{r LDA}
+
+#https://www.stat.berkeley.edu/~s133/Class2a.html
+klda = function(k,formula,data,cl){
+   grps = cut(1:nrow(data),k,labels=FALSE)[sample(1:nrow(data))]
+   pred = lapply(1:k,function(i,formula,data){
+	    omit = which(grps == i)
+	    z = lda(formula,data=data[-omit,])
+            predict(z,data[omit,])
+	    },formula,data)
+
+   wh = unlist(lapply(pred,function(pp)pp$class))
+   table(wh,cl[order(grps)])
+}
+ldacv <- list()
+for (i in 1:10) {
+  c <- klda(10, label~., vdata ,label)
+  ldacv[i] <-  (c[2]+c[3])/sum(c)
+}
+plot(seq(1,10,1),ldacv, type = "b", main = "LDA Cross Validation 10F", xlab = "Iteration", ylab = "Error")
+```
+
+##QDA
+As with LDA, we run QDA over five partitions of data. 
+```{r QDA}
+
+for (i in 1:5) {
+  n = nrow(dataScale)
+  trainprop <- 0.60
+  testprop <- 0.40
+  trainNo <- sample(n, n * trainprop)
+  testNo <- sample(setdiff(1:n, trainNo) , n * testprop)
+  
+  trainset <- data.frame(dataScale, label)[trainNo,]
+  testset <- data.frame(dataScale, label)[testNo,]
+
+  qda.fit = qda(trainset$label~., data=trainset)
+  qda.pred <- predict(qda.fit, newdata = testset, type="response")
+  mytable <- table(testset$label, qda.pred$class)   
+
+  correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+  err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+  type1err <- mytable[2]/sum(mytable[1:4])
+  type2err <- mytable[3]/sum(mytable[1:4])
+  power <- 1- type2err
+  precision <- mytable[4]/(mytable[2]+mytable[4])
+  QDA <- paste("QDA", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+  print(paste("Partition", i, ":", QDA))
+}
+```
+
+Lets cross validate
+```{r, warning=FALSE}
+kqda = function(k,formula,data,cl){
+ grps = cut(1:nrow(data),k,labels=FALSE)[sample(1:nrow(data))]
+ pred = lapply(1:k,function(i,formula,data){
+    omit = which(grps == i)
+    z = qda(formula,data=data[-omit,])
+          predict(z,data[omit,])
+    },formula,data)
+ wh = unlist(lapply(pred,function(pp)pp$class))
+ table(wh,cl[order(grps)])
+}
+qdacv <- list()
+for (i in 1:10) {
+  c <- kqda(10, label~., vdata ,label)
+  qdacv[i] <-  (c[2]+c[3])/sum(c)
+}
+plot(seq(1,10,1),qdacv, type = "b", main = "QDA Cross Validation 10F", xlab = "Iteration", ylab = "Error")
+
+correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+type1err <- mytable[2]/sum(mytable[1:4])
+type2err <- mytable[3]/sum(mytable[1:4])
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+QDA <- paste("QDA", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+             "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+             "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+QDA
+```
+
+
+##Naive Bayes
+Running Naive Bayes of five partitions of data.
+```{r Naive Bayes, warning=FALSE}
+
+for (i in 1:5) {
+  n = nrow(dataScale)
+  trainprop <- 0.75
+  testprop <- 0.25
+  trainNo <- sample(n, n * trainprop)
+  testNo <- sample(setdiff(1:n, trainNo) , n * testprop)
+  
+  trainset <- data.frame(dataScale, label)[trainNo,]
+  testset <- data.frame(dataScale, label)[testNo,]
+ 
+  nb.fit <- naiveBayes(trainset$label~., data = trainset)
+  nb.pred <- predict(nb.fit, newdata = testset)
+  mytable <- table(testset$label, nb.pred)   
+    
+  correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+  err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+  type1err <- mytable[2]/sum(mytable[1:4])
+  type2err <- mytable[3]/sum(mytable[1:4])
+  power <- 1- type2err
+  precision <- mytable[4]/(mytable[2]+mytable[4])
+  NB <- paste("Naive Bayes -- ","Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+  print(paste("Partition", i, ":", NB))
+}
+
+
+```
+
+Lets cross validate to check the model
+```{r, warning=FALSE}
+train_control <- trainControl(method="cv", number=10)
+
+#create model
+dbcv <- list()
+for (i in 1:10) {
+fit <- train(train, y.train, method = "nb",trControl=train_control)
+dbcv[i] <- 1 - fit$results[1,4]
+}
+plot(seq(1,10,1), dbcv, type = "b", main = "Naive Bayes Cross Validation 10F", xlab = "Iteration", ylab = "Error")
+
+```
+
+```{r PLS, eval=FALSE, include=FALSE}
+### This pls package doesn't do classification
+pls.fit <- plsr(as.factor(y.train) ~ ., data=train, validation="CV", family = "binomial")
+?plsr
+summary(pls.fit)
+validationplot(pls.fit, val.type="MSEP")
+
+pls.fit$loadings
+
+pls.pred <- predict(pls.fit, data[test,], ncomp=3, type='response')
+mean((pls.pred - y.test)^2)
+```
+
+
+```{r PCA, eval=FALSE, include=FALSE}
+# PCA does not enjoy being so good at predicting. It also failed to run.
+
+###############
+### RUN PCA ###
+pca <- prcomp(train, scale = FALSE, center = FALSE)
+plot(cumsum(pca$sdev^2/sum(pca$sdev^2)))
+###############
+### z.train ###
+
+cv.error <- c()
+for (i in 1:(ncol(dataScale)-1)){
+  Z.train <- data.frame(data.frame(as.matrix(train) %*% as.matrix(pca$rotation[,1:(i+1)])))
+  Z.test <- data.frame(data.frame(as.matrix(test) %*% as.matrix(pca$rotation[,1:(i+1)]))) 
+  
+  ## GLM Model ##
+#  glm.fit <- glm(as.factor(y.train) ~., data = Z.train, family = binomial )
+#  cv.error[i] <- cv.glm(data.frame(Z.train, y.train), glm.fit)$delta[1]
+#  print(i)
+  
+  rd.fit <- glmnet(as.matrix(Z.train), as.factor(y.train), alpha = 0, lambda = lambdas, family = "binomial")
+  cv.error[i] <- cv.glmnet(as.matrix(Z.train), as.factor(y.train), alpha = 0, lambda = lambdas, family = "binomial")$delta[1]
+}
+plot(seq(2, ncol(dataScale), 1), cv.error, main = "CV Error for PCR", xlab = "PC", ylab = "Error")
+
+n.pcs <- 9
+Z.train <- data.frame(data.frame(as.matrix(train) %*% as.matrix(pca$rotation[,1:n.pcs])))
+Z.test <- data.frame(data.frame(as.matrix(test) %*% as.matrix(pca$rotation[,1:n.pcs]))) 
+
+#############  
+# GLM Model #
+glm.fit <- glm(as.factor(y.train) ~., data = Z.train, family = binomial )
+hist(predict(glm.fit,newdata = Z.test, type='response'))
+
+###########
+#  Ridge  #
+
+rd.fit <- glmnet(as.matrix(Z.train), as.factor(y.train), alpha = 0, lambda = lambdas, family = "binomial")
+hist(predict)
+
+### Looking at error ####
+errTypes <- matrix(ncol = 2, nrow = 1000) 
+cTables <- matrix(ncol = 4, nrow = 1000) 
+colnames(errTypes) <- c("false positives","false negatives")
+b = 0
+for (i in 1:nrow(errTypes)){
+  b = b + 0.001
+  glm.pred <- rep('PredFemale', nrow(Z.test))
+  glm.pred[predict(glm.fit,newdata = Z.test, type='response')>b] <- 'PredMale'
+  errTypes[i,] <- c((table(glm.pred, y.test)[2])/nrow(Z.test), (table(glm.pred, y.test)[3])/nrow(Z.test))
+  cTables[i,] <- table(glm.pred, y.test)[1:4]
+}
+
+
+
+plot(1, type="n", xlim=c(0, 1), ylim=c(0, 1), xlab = "Above is Yes Threshold", ylab = "Err Rate",
+     main = "False Pos and Neg as decision boundary increases PCA PC=4")
+legend(.4,1, c("False Pos","False Neg", "Total Error"), lty=c(1,1), lwd=c(1.5,1.5),col=c("blue","green", "red"))
+lines(seq(.001, 1, .001), errTypes[,1], col = "blue", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,2], col = "green", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,1]+errTypes[,2], col = "red")
+abline(h = 0)
+
+
+## .15 is a good spot
+
+glm.pred <- rep('PredFemale', nrow(Z.test))
+glm.pred[predict(glm.fit,newdata = Z.test, type='response')>(0.5)] <- 'PredMale'
+
+mytable<- table(glm.pred, y.test)
+mytable
+correct <- (mytable[1]+mytable[4])/nrow(Z.test)
+err <- (mytable[2] + mytable[3])/nrow(Z.test)
+type1err <- mytable[2]/nrow(Z.test)
+type2err <- mytable[3]/nrow(Z.test)
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+PCA16 <- paste("PCA 16 -- ", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+PCA16
+
+
+
+
+```
+
+
+
+# Classifier Ensembles
+We initially started using classifier ensmbles in hopes of accurately predicting the results in our first data set. When we abandoned that data and picked up the voice data, we decided to put our existing infrastructure to use and run the new data through. We did not cross validate these models as they did not perform well initially.
+```{r Random Forest, eval=FALSE, include=FALSE}
+# random forest isnt working either.
+
+data.rf <- randomForest(y.train ~ ., data = train)
+plot(data.rf)
+rf.pred <- predict(data.rf,test)
+
+#all predictors
+#out-of-bag sampling error
+oob.err = double(13)
+#test error
+test.err = double(13)
+
+for(mtry in 1:13) 
+{
+  rf=randomForest(y.train ~ . , data = train , mtry=mtry,ntree=400) 
+  oob.err[mtry] = rf$mse[400] #Error of all Trees fitted
+  
+  pred<-predict(rf,test) #Predictions on Test Set for each Tree
+  test.err[mtry]= with(test, mean( (y.test - pred)^2)) #Mean Squared Test Error
+  
+  cat(mtry," ") #printing the output to the console
+  
+}
+
+#plotting test and out-of-bag error:
+matplot(1:mtry , cbind(oob.err,test.err), pch=19 , col=c("red","blue"),type="b",ylab="Mean Squared Error",xlab="Number of Predictors Considered at each Split")
+legend("topright",legend=c("Out of Bag Error","Test Error"),pch=19, col=c("red","blue"))
+```
+## Rotation Forest
+The rotation forest uses principal components to build trees for use in classification. Its use was established in a 2006 paper *Rotation Forest: A New Classifier Ensemble Method* by JJ. Rodriguez et al.
+```{r Rotation Forest}
+options(na.action = "na.pass")
+x<-data.frame(model.matrix(label~.,dataScale))
+y<-as.numeric(data$label)
+
+
+set.seed(1)
+rftrain<-sample(1:nrow(x), nrow(x)/2)
+rftest<-(-rftrain)
+rfy.test<-y[rftest]
+rftest <- x[rftest,]
+rfy.train <- y[rftrain]
+rftrain <- x[rftrain,]
+
+
+rf.fit <- rotationForest(rftrain, as.factor(rfy.train))
+hist(predict(rf.fit, rftest))
+
+hist(predict(rf.fit, newdata = rftrain, type='response'))
+rf.pred <- rep('PredFemale', nrow(rftrain))
+rf.pred[predict(rf.fit, newdata = rftrain, type='response')>0.5] <- 'PredMale'
+table(rf.pred)
+table(rf.pred, rfy.train)
+
+rf.pred <- rep('PredFemale', nrow(test))
+rf.pred[predict(rf.fit, newdata = rftest, type='response')>0.5] <- 'PredMale'
+table(rf.pred, rfy.test)
+```
+
+```{r, include=FALSE}
+errTypes <- matrix(ncol = 2, nrow = 1000) 
+cTables <- matrix(ncol = 4, nrow = 1000) 
+colnames(errTypes) <- c("false positives","false negatives")
+b = 0
+for (i in 1:nrow(errTypes)){
+  b = b + 0.001
+  rf.pred <- rep('PredFemale', nrow(test))
+  rf.pred[predict(rf.fit, newdata = rftest, type='response')>b] <- 'PredMale'
+  errTypes[i,] <- c((table(rf.pred, rfy.test)[2])/nrow(rftest), (table(rf.pred, rfy.test)[3])/nrow(rftest))
+  cTables[i,] <- table(rf.pred, rfy.test)[1:4]
+}
+
+plot(1, type="n", xlim=c(0, 1), ylim=c(0, 1), xlab = "Above is Yes Threshold", ylab = "Err Rate",
+     main = "False Pos and Neg as decision boundary increases")
+legend(.7,1, c("False Pos","False Neg", "Total Error"), lty=c(1,1), lwd=c(1.5,1.5),col=c("blue","green", "red"))
+lines(seq(.001, 1, .001), errTypes[,1], col = "blue", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,2], col = "green", lwd = 1.5)
+lines(seq(.001, 1, .001), errTypes[,1]+errTypes[,2], col = "red")
+abline(h = 0)
+
+
+rf.pred <- rep('PredFemale', nrow(test))
+rf.pred[predict(rf.fit, newdata = rftest, type='response')>0.5] <- 'PredMale'
+mytable <- table(rf.pred, rfy.test)
+correct <- (mytable[1]+mytable[4])/sum(mytable[1:4])
+err <- (mytable[2] + mytable[3])/sum(mytable[1:4])
+type1err <- mytable[2]/sum(mytable[1:4])
+type2err <- mytable[3]/sum(mytable[1:4])
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+RtF <- paste("RotationForest -- ", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+RtF
+
+```
+
+## XGBoost (Extreme Graident Boosting)
+http://xgboost.readthedocs.io/en/latest/model.html#tree-boosting 
+
+XGBoost creates tree ensembles my minimizing MSE at every step. There is more too it but we will get to that next semester.
+```{r XGBoost}
+dtrain <- xgb.DMatrix(data = as.matrix(train), label = (as.numeric(y.train)-1))
+dtest <- xgb.DMatrix(data = as.matrix(test), label = (as.numeric(y.test)-1))
+
+bst.fit <- xgboost(data = dtrain, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "binary:logistic", verbose = 0)
+
+bst.pred <- predict(bst.fit, as.matrix(test))
+hist(bst.pred)
+bst.pred <- rep('PredFemale', nrow(test))
+bst.pred[predict(bst.fit, as.matrix(test))>0.5] <- 'PredMale'
+
+mytable<- table(bst.pred, y.test)
+mytable
+
+```
+
+```{r, eval=FALSE, include=FALSE}
+
+## Ok lets tune it
+best_param = list()
+best_seednumber = 1234
+best_logloss = Inf
+best_logloss_index = 0
+
+for (iter in 1:100) {
+    param <- list(objective = "multi:softprob",
+          eval_metric = "mlogloss",
+          num_class = 2,
+          max_depth = sample(6:10, 1),
+          eta = runif(1, .01, .3),
+          gamma = runif(1, 0.0, 0.2), 
+          subsample = runif(1, .6, .9),
+          colsample_bytree = runif(1, .5, .8), 
+          min_child_weight = sample(1:40, 1),
+          max_delta_step = sample(1:10, 1)
+          )
+    cv.nround = 1000
+    cv.nfold = 5
+    seed.number = sample.int(10000, 1)[[1]]
+    set.seed(seed.number)
+    mdcv <- xgb.cv(data=dtrain, params = param, nthread=6, 
+                    nfold=cv.nfold, nrounds=cv.nround,
+                    verbose = T, early.stop.round=8, maximize=FALSE)
+
+    min_logloss = min(mdcv$evaluation_log[,4])
+    m = min(mdcv$evaluation_log[,4])
+    min_logloss_index = which(mdcv$evaluation_log[,4] == m)
+
+    if (min_logloss < best_logloss) {
+        best_logloss = min_logloss
+        best_logloss_index = min_logloss_index
+        best_seednumber = seed.number
+        best_param = param
+    }
+}
+
+
+
+md <- xgboost(data=dtrain, params = best_param, nround = 100, verbose = 0, objective = "binary:logistic")
+bst.pred <- rep('PredFemale', nrow(test))
+bst.pred[predict(md, dtest)>=0.5] <- 'PredMale'
+mytable<- table(bst.pred, y.test)
+mytable
+
+
+
+# Run on all data
+dval <- xgb.DMatrix(data = as.matrix(data[,-9]), label = data$label)
+bst.pred <- rep('PredFemale', nrow(vdata))
+bst.pred[(predict(md, newdata = dval) <= 0.1)] <- "PredMale"
+mytable<- table(bst.pred, label)
+mytable
+
+
+```
+
+```{r, echo=FALSE}
+correct <- (mytable[1]+mytable[4])/nrow(test)
+err <- (mytable[2] + mytable[3])/nrow(test)
+type1err <- mytable[2]/nrow(test)
+type2err <- mytable[3]/nrow(test)
+power <- 1- type2err
+precision <- mytable[4]/(mytable[2]+mytable[4])
+XGB <- paste("XGBoost -- ", "Correct:", round(correct, 5), "| Error:", round(err, 5),
+               "| T1 err:", round(type1err, 5), "| T2 err:", round(type2err, 5),
+               "| Power: ", round(power, 5), "| Precision: ", round(precision, 5))
+XGB
+```
+
+
+
+
+# Results
+Refer to CV plots for better estimate of model efficacy
+```{r Results, echo=FALSE}
+#Top Models
+print("Best models")
+LDA
+QDA
+LR
+KNN1
+KNN3
+
+print("Lower performing models")
+RID
+NB
+RtF
+XGB
+```
+
+

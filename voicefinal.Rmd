@@ -1,6 +1,6 @@
 ---
 title: "ML Final"
-author: "Will Bowman, Lanxin Xu, Rob Downs, Karen Ficenec"
+author: "Will Bowman, Lanxin(Lancy) Xu, Rob Downs, Karen Ficenec"
 date: "December 8, 2017"
 output:
   html_document: default
